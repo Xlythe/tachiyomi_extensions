@@ -274,13 +274,9 @@ class Mangabat : ConfigurableSource, UnmeteredSource, HttpSource() {
             .toHttpUrl()
             .newBuilder()
             .addQueryParameter("s", "all")
-            .addQueryParameter("orby", if(sortByAscending) {"az"} else {""})
+            .addQueryParameter("orby", if (sortByAscending) { "az" } else { "" })
             .addQueryParameter("page", page.toString())
             .addQueryParameter("keyw", query)
-
-
-
-
             .addQueryParameter("currentCategoryId", currentCategoryId.toString())
             .addQueryParameter("tagFilterIncludeMode", tagFilterIncludeModeIndex.toString())
             .addQueryParameter("tagFilterExcludeMode", tagFilterExcludeModeIndex.toString())

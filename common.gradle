@@ -8,6 +8,9 @@ android {
         main {
             manifest.srcFile "AndroidManifest.xml"
             java.srcDirs = ['src']
+            java.exclude 'test/**', 'androidTest/**'
+            kotlin.srcDirs = ['src']
+            kotlin.exclude 'test/**', 'androidTest/**'
             res.srcDirs = ['res']
             assets.srcDirs = ['assets']
         }
