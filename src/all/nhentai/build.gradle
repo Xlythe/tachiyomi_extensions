@@ -7,6 +7,7 @@ ext {
     pkgNameSuffix = 'all.nhentai'
     extClass = '.NHFactory'
     extVersionCode = 54
+    isNsfw = true
 }
 
 apply from: "$rootDir/common.gradle"

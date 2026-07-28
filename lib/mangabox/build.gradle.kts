@@ -10,23 +10,17 @@ android {
         minSdk = AndroidConfig.minSdk
     }
 
-    namespace = "eu.kanade.tachiyomi.extension"
+    namespace = "eu.kanade.tachiyomi.multisrc.mangabox"
 
-    @Suppress("UnstableApiUsage")
     sourceSets {
         named("main") {
-            manifest.srcFile("AndroidManifest.xml")
-            res.setSrcDirs(listOf("res"))
-        }
-    }
-
-    libraryVariants.all {
-        generateBuildConfigProvider?.configure {
-            enabled = false
+            java.srcDirs("src")
+            res.srcDirs("res")
         }
     }
 }
 
 dependencies {
+    implementation(project(":core"))
     compileOnly(libs.bundles.common)
 }

@@ -1,541 +1,327 @@
 package com.xlythe.tachiyomi.extension.en.mangabat
 
-import android.app.Application
 import android.content.SharedPreferences
-import android.text.InputType
-import android.util.Log
-import android.widget.Toast
-import androidx.preference.EditTextPreference
-import androidx.preference.PreferenceScreen
+import eu.kanade.tachiyomi.multisrc.mangabox.MangaBox
 import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.network.asObservableSuccess
-import eu.kanade.tachiyomi.source.ConfigurableSource
-import eu.kanade.tachiyomi.source.UnmeteredSource
-import eu.kanade.tachiyomi.source.model.Filter
-import eu.kanade.tachiyomi.source.model.FilterList
-import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.source.online.HttpSource
+import eu.kanade.tachiyomi.util.asJsoup
+import keiyoushi.utils.LeadingPageIdentity
+import keiyoushi.utils.PageFingerprint
+import keiyoushi.utils.PageFingerprintHistory
+import keiyoushi.utils.PrefetchedPageImage
+import keiyoushi.utils.PrefetchedPageImageStore
+import keiyoushi.utils.createPageFingerprint
+import keiyoushi.utils.getPreferencesLazy
+import keiyoushi.utils.hasDuplicateFingerprintAtEdge
+import keiyoushi.utils.initialEdgeFingerprintPositions
+import keiyoushi.utils.leadingPagePosition
+import keiyoushi.utils.pageIndexForFingerprintPosition
+import keiyoushi.utils.reindexPages
+import keiyoushi.utils.scanLeadingDuplicates
+import keiyoushi.utils.scanTrailingDuplicates
+import keiyoushi.utils.trailingPagePosition
+import kotlinx.serialization.SerialName
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
-import okhttp3.Credentials
-import okhttp3.Dns
-import okhttp3.Headers
-import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.OkHttpClient
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Request
 import okhttp3.Response
-import okhttp3.internal.toImmutableList
-import rx.Observable
-import rx.Single
-import rx.schedulers.Schedulers
-import uy.kohesive.injekt.Injekt
-import uy.kohesive.injekt.api.get
-import uy.kohesive.injekt.injectLazy
-import java.util.concurrent.TimeUnit
-import kotlin.math.min
+import org.jsoup.nodes.Document
+import java.text.SimpleDateFormat
+import java.util.Locale
+import java.util.TimeZone
 
-class Mangabat : ConfigurableSource, UnmeteredSource, HttpSource() {
-    override val name = "Mangabat"
-    override val id = 3100117499901280807L
-    override val baseUrl by lazy { getPrefBaseUrl() }
-    private val baseLogin by lazy { getPrefBaseLogin() }
-    private val basePassword by lazy { getPrefBasePassword() }
+class Mangabat :
+    MangaBox(
+        "Mangabat",
+        arrayOf(
+            "www.mangabats.com",
+        ),
+        "en",
+    ) {
+    private val prefetchedPageImages = PrefetchedPageImageStore()
 
-    override val lang = "en"
-    override val supportsLatest = false
-
-    private val json: Json by injectLazy()
-
-    override val client: OkHttpClient =
-        network.client.newBuilder()
-            .dns(Dns.SYSTEM) // don't use DNS over HTTPS as it breaks IP addressing
-            .callTimeout(2, TimeUnit.MINUTES)
+    override val client =
+        super.client
+            .newBuilder()
+            .addInterceptor(prefetchedPageImages::intercept)
             .build()
 
-    override fun headersBuilder(): Headers.Builder = Headers.Builder().apply {
-        if (basePassword.isNotEmpty() && baseLogin.isNotEmpty()) {
-            val credentials = Credentials.basic(baseLogin, basePassword)
-            add("Authorization", credentials)
-        }
+    private val duplicatePagePreferences: SharedPreferences by getPreferencesLazy()
+    private val duplicatePageHistory by lazy {
+        PageFingerprintHistory(duplicatePagePreferences, DUPLICATE_PAGE_HISTORY_NAMESPACE)
     }
 
-    // ------------- Popular Manga -------------
+    private val json = Json { ignoreUnknownKeys = true }
+    private val chapterDateFormat =
+        SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.ENGLISH).apply {
+            timeZone = TimeZone.getTimeZone("UTC")
+        }
 
-    // Route the popular manga view through search to avoid duplicate code path
-    override fun popularMangaRequest(page: Int): Request =
-        searchMangaRequest(page, "", FilterList())
+    override fun popularMangaSelector() = MANGA_LIST_SELECTOR
 
-    override fun popularMangaParse(response: Response): MangasPage =
-        searchMangaParse(response)
+    override fun latestUpdatesSelector() = MANGA_LIST_SELECTOR
 
-    // ------------- Manga Details -------------
+    override fun mangaDetailsRequest(manga: SManga): Request {
+        if (manga.url.contains("mangabat.com/")) {
+            throw Exception(MIGRATE_MESSAGE)
+        }
+        return super.mangaDetailsRequest(manga)
+    }
 
-    override fun mangaDetailsRequest(manga: SManga) =
-        GET("$checkedBaseUrl/api/v1/manga/${manga.url}/?onlineFetch=true", headers)
-
-    override fun mangaDetailsParse(response: Response): SManga =
-        json.decodeFromString<MangaDataClass>(response.body.string()).toSManga()
-
-    // ------------- Chapter -------------
-
-    override fun chapterListRequest(manga: SManga): Request =
-        GET("$checkedBaseUrl/api/v1/manga/${manga.url}/chapters?onlineFetch=true", headers)
+    override fun chapterListRequest(manga: SManga): Request {
+        val slug =
+            manga.url
+                .toHttpUrlOrNull()
+                ?.pathSegments
+                ?.lastOrNull()
+                ?: manga.url.trimEnd('/').substringAfterLast("/")
+        return GET("$baseUrl/api/manga/$slug/chapters", headers)
+    }
 
     override fun chapterListParse(response: Response): List<SChapter> =
-        json.decodeFromString<List<ChapterDataClass>>(response.body.string()).map {
-            it.toSChapter()
-        }
-
-    // ------------- Page List -------------
-
-    override fun fetchPageList(chapter: SChapter): Observable<List<Page>> {
-        return client.newCall(pageListRequest(chapter))
-            .asObservableSuccess()
-            .map { response ->
-                pageListParse(response, chapter)
+        json.decodeFromString<MangabatChapterResponse>(response.body.string()).data.chapters.let { chapters ->
+            val seriesSlug =
+                response.request.url.pathSegments
+                    .dropLast(1)
+                    .last()
+            chapters.map { chapter ->
+                SChapter.create().apply {
+                    name = chapter.name
+                    url = "/manga/$seriesSlug/${chapter.slug}"
+                    date_upload = chapter.updatedAt.toChapterDate()
+                }
             }
-    }
-
-    override fun pageListRequest(chapter: SChapter): Request {
-        val mangaId = chapter.url.split(" ").first()
-        val chapterIndex = chapter.url.split(" ").last()
-
-        return GET("$checkedBaseUrl/api/v1/manga/$mangaId/chapter/$chapterIndex/?onlineFetch=True", headers)
-    }
-
-    private fun pageListParse(response: Response, sChapter: SChapter): List<Page> {
-        val mangaId = sChapter.url.split(" ").first()
-        val chapterIndex = sChapter.url.split(" ").last()
-
-        val chapter = json.decodeFromString<ChapterDataClass>(response.body.string())
-
-        return List(chapter.pageCount) {
-            Page(it + 1, "", "$checkedBaseUrl/api/v1/manga/$mangaId/chapter/$chapterIndex/page/$it/")
         }
+
+    override fun pageListParse(document: Document): List<Page> {
+        val pages = parseRawPageList(document)
+        return filterEdgeDuplicatePages(pages) { fetchAdjacentChapterPages(document) }
     }
 
-    // ------------- Filters & Search -------------
+    private fun parseRawPageList(document: Document): List<Page> = super.pageListParse(document)
 
-    private var categoryList: List<CategoryDataClass> = emptyList()
-    private val defaultCategoryId: Int
-        get() = categoryList.firstOrNull()?.id ?: 0
-
-    private val resultsPerPageOptions = listOf(10, 15, 20, 25)
-    private val defaultResultsPerPage = resultsPerPageOptions.first()
-
-    private val sortByOptions = listOf(
-        "Title",
-        "Artist",
-        "Author",
-        "Date added",
-        "Total chapters",
-    )
-    private val defaultSortByIndex = 0
-
-    private var tagList: List<String> = emptyList()
-    private val tagModeAndString = "AND"
-    private val tagModeOrString = "OR"
-    private val tagModes = listOf(tagModeAndString, tagModeOrString)
-    private val defaultIncludeTagModeIndex = tagModes.indexOf(tagModeAndString)
-    private val defaultExcludeTagModeIndex = tagModes.indexOf(tagModeOrString)
-    private val tagFilterModeIncludeString = "Include"
-    private val tagFilterModeExcludeString = "Exclude"
-
-    class CategorySelect(categoryList: List<CategoryDataClass>) :
-        Filter.Select<String>("Category", categoryList.map { it.name }.toTypedArray())
-
-    class ResultsPerPageSelect(options: List<Int>) :
-        Filter.Select<Int>("Results per page", options.toTypedArray())
-
-    class SortBy(options: List<String>) :
-        Filter.Sort(
-            "Sort by",
-            options.toTypedArray(),
-            Selection(0, true),
-        )
-
-    class Tag(name: String, state: Int) :
-        Filter.TriState(name, state)
-
-    class TagFilterMode(type: String, tagModes: List<String>, defaultIndex: Int = 0) :
-        Filter.Select<String>(type, tagModes.toTypedArray(), defaultIndex)
-
-    class TagSelector(tagList: List<String>) :
-        Filter.Group<Tag>(
-            "Tags",
-            tagList.map { tag -> Tag(tag, 0) },
-        )
-
-    class TagFilterModeGroup(
-        tagModes: List<String>,
-        includeString: String,
-        excludeString: String,
-        includeDefaultIndex: Int = 0,
-        excludeDefaultIndex: Int = 0,
-    ) :
-        Filter.Group<TagFilterMode>(
-            "Tag Filter Modes",
-            listOf(
-                TagFilterMode(includeString, tagModes, includeDefaultIndex),
-                TagFilterMode(excludeString, tagModes, excludeDefaultIndex),
-            ),
-        )
-
-    override fun getFilterList(): FilterList = FilterList(
-        Filter.Header("Press reset to refresh tag list and attempt to fetch categories."),
-        Filter.Header("Tag list shows only the tags of currently displayed manga."),
-        Filter.Header("\"All\" shows all manga regardless of category."),
-        CategorySelect(refreshCategoryList(baseUrl).let { categoryList }),
-        Filter.Separator(),
-        TagFilterModeGroup(
-            tagModes,
-            tagFilterModeIncludeString,
-            tagFilterModeExcludeString,
-            defaultIncludeTagModeIndex,
-            defaultExcludeTagModeIndex,
-        ),
-        TagSelector(tagList),
-        SortBy(sortByOptions),
-        ResultsPerPageSelect(resultsPerPageOptions),
-    )
-
-    private fun refreshCategoryList(baseUrl: String) {
-        Single.fromCallable {
-            client.newCall(GET("$baseUrl/api/v1/category", headers)).execute()
-        }
-            .subscribeOn(Schedulers.io())
-            .observeOn(Schedulers.io())
-            .subscribe(
-                { response ->
-                    categoryList = try {
-                        // Add a pseudo category to list all manga across all categories
-                        listOf(CategoryDataClass(-1, -1, "All", false)) +
-                            json.decodeFromString<List<CategoryDataClass>>(response.body.string())
-                    } catch (e: Exception) {
-                        emptyList()
+    private fun fetchAdjacentChapterPages(document: Document): List<Page>? =
+        runCatching {
+            val location = document.location().toMangabatChapterLocation() ?: return@runCatching null
+            val chapters =
+                client.newCall(GET("$baseUrl/api/manga/${location.seriesSlug}/chapters", headers)).execute().use { response ->
+                    if (!response.isSuccessful) {
+                        return@runCatching null
                     }
-                },
-                {},
+                    json.decodeFromString<MangabatChapterResponse>(response.body.string()).data.chapters
+                }
+            val adjacentSlug =
+                chapters.adjacentChapterSlug(location.chapterSlug)
+                    ?: return@runCatching null
+
+            client.newCall(GET("$baseUrl/manga/${location.seriesSlug}/$adjacentSlug", headers)).execute().use { response ->
+                if (!response.isSuccessful) {
+                    return@runCatching null
+                }
+                parseRawPageList(response.asJsoup())
+            }
+        }.getOrNull()
+
+    private fun filterEdgeDuplicatePages(
+        pages: List<Page>,
+        adjacentPagesProvider: () -> List<Page>?,
+    ): List<Page> {
+        prefetchedPageImages.clear()
+        val identity =
+            pages
+                .firstNotNullOfOrNull { page -> page.imageUrl?.toMangabatPageIdentity() }
+                ?: return pages
+        val referenceFingerprints =
+            duplicatePageHistory
+                .previousFingerprints(identity)
+                .groupByTo(mutableMapOf()) { it.index }
+                .mapValuesTo(mutableMapOf()) { (_, values) -> values.mapTo(mutableListOf()) { it.value } }
+        val inspectedPages = mutableMapOf<Int, InspectedEdgePage>()
+        val currentFingerprints = linkedMapOf<Int, PageFingerprint>()
+
+        val adjacentPages =
+            if (referenceFingerprints.isEmpty()) {
+                adjacentPagesProvider()
+            } else {
+                null
+            }
+        val adjacentIdentity =
+            adjacentPages
+                ?.firstNotNullOfOrNull { page -> page.imageUrl?.toMangabatPageIdentity() }
+                ?.takeIf { it.seriesKey == identity.seriesKey && it.chapterKey != identity.chapterKey }
+        val inspectedAdjacentPages = mutableMapOf<Int, InspectedEdgePage>()
+        val adjacentFingerprints = linkedMapOf<Int, PageFingerprint>()
+
+        fun ensureAdjacentFingerprint(position: Int) {
+            val referencePages = adjacentPages ?: return
+            if (adjacentIdentity == null || position in adjacentFingerprints) {
+                return
+            }
+            val index = pageIndexForFingerprintPosition(position, referencePages.size) ?: return
+            val inspected =
+                inspectedAdjacentPages[index]
+                    ?: inspectEdgePage(referencePages[index])?.also { inspectedAdjacentPages[index] = it }
+                    ?: return
+            adjacentFingerprints[position] = inspected.fingerprint
+            referenceFingerprints.getOrPut(position, ::mutableListOf) += inspected.fingerprint
+        }
+
+        adjacentPages
+            ?.takeIf { adjacentIdentity != null }
+            ?.let { initialEdgeFingerprintPositions(it.size).forEach(::ensureAdjacentFingerprint) }
+
+        fun isDuplicate(
+            index: Int,
+            page: Page,
+            position: Int,
+        ): Boolean {
+            ensureAdjacentFingerprint(position)
+            val inspected =
+                inspectedPages[index]
+                    ?: inspectEdgePage(page)?.also { inspectedPages[index] = it }
+                    ?: return false
+            currentFingerprints[position] = inspected.fingerprint
+            return referenceFingerprints.hasDuplicateFingerprintAtEdge(position, inspected.fingerprint)
+        }
+
+        val leadingScan =
+            scanLeadingDuplicates(pages) { index, page ->
+                isDuplicate(index, page, leadingPagePosition(index))
+            }
+        val trailingScan =
+            scanTrailingDuplicates(pages) { index, page ->
+                isDuplicate(index, page, trailingPagePosition(index, pages.size))
+            }
+
+        if (adjacentIdentity != null) {
+            duplicatePageHistory.recordChapter(
+                adjacentIdentity,
+                adjacentFingerprints.map { (position, fingerprint) -> IndexedValue(position, fingerprint) },
             )
-    }
-
-    private fun refreshTagList(mangaList: List<MangaDataClass>) {
-        val newTagList = mutableListOf<String>()
-        for (mangaDetails in mangaList) {
-            newTagList.addAll(mangaDetails.genre)
         }
-        tagList = newTagList
-            .distinctBy { tag -> tag.lowercase() }
-            .sortedBy { tag -> tag.lowercase() }
-            .filter { tag -> tag.trim() != "" }
-    }
-
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        // Embed search query and scope into URL params for processing in searchMangaParse
-        var currentCategoryId = defaultCategoryId
-        var resultsPerPage = defaultResultsPerPage
-        var sortByIndex = defaultSortByIndex
-        var sortByAscending = true
-        val tagIncludeList = mutableListOf<String>()
-        val tagExcludeList = mutableListOf<String>()
-        var tagFilterIncludeModeIndex = defaultIncludeTagModeIndex
-        var tagFilterExcludeModeIndex = defaultExcludeTagModeIndex
-        filters.forEach { filter ->
-            when (filter) {
-                is CategorySelect -> currentCategoryId = categoryList[filter.state].id
-                is ResultsPerPageSelect -> resultsPerPage = resultsPerPageOptions[filter.state]
-                is SortBy -> {
-                    sortByIndex = filter.state?.index ?: sortByIndex
-                    sortByAscending = filter.state?.ascending ?: sortByAscending
-                }
-                is TagFilterModeGroup -> {
-                    filter.state.forEach { tagFilterMode ->
-                        when (tagFilterMode.name) {
-                            tagFilterModeIncludeString -> tagFilterIncludeModeIndex = tagFilterMode.state
-                            tagFilterModeExcludeString -> tagFilterExcludeModeIndex = tagFilterMode.state
-                        }
-                    }
-                }
-                is TagSelector -> {
-                    filter.state.forEach { tagFilter ->
-                        when {
-                            tagFilter.isIncluded() -> tagIncludeList.add(tagFilter.name)
-                            tagFilter.isExcluded() -> tagExcludeList.add(tagFilter.name)
-                        }
-                    }
-                }
-                else -> {}
-            }
-        }
-        val url = "$checkedBaseUrl/advanced_search"
-            .toHttpUrl()
-            .newBuilder()
-            .addQueryParameter("s", "all")
-            .addQueryParameter("orby", if (sortByAscending) { "az" } else { "" })
-            .addQueryParameter("page", page.toString())
-            .addQueryParameter("keyw", query)
-            .addQueryParameter("currentCategoryId", currentCategoryId.toString())
-            .addQueryParameter("tagFilterIncludeMode", tagFilterIncludeModeIndex.toString())
-            .addQueryParameter("tagFilterExcludeMode", tagFilterExcludeModeIndex.toString())
-            .addQueryParameter("tagIncludeList", tagIncludeList.joinToString(","))
-            .addQueryParameter("tagExcludeList", tagExcludeList.joinToString(","))
-            .addQueryParameter("resultsPerPage", resultsPerPage.toString())
-            .build()
-        return GET(url, headers)
-    }
-
-    override fun searchMangaParse(response: Response): MangasPage {
-        val request = response.request
-        var searchQuery: String? = ""
-        var currentCategoryId = defaultCategoryId
-        var sortByIndex = defaultSortByIndex
-        var sortByAscending = true
-        var tagIncludeList = mutableListOf<String>()
-        var tagExcludeList = mutableListOf<String>()
-        var tagFilterIncludeModeIndex = defaultIncludeTagModeIndex
-        var tagFilterExcludeModeIndex = defaultExcludeTagModeIndex
-        var resultsPerPage = defaultResultsPerPage
-        var page = 1
-
-        // Check if URL has query params and parse them
-        if (!request.url.query.isNullOrEmpty()) {
-            searchQuery = request.url.queryParameter("searchQuery")
-            currentCategoryId = request.url.queryParameter("currentCategoryId")?.toIntOrNull() ?: currentCategoryId
-            sortByIndex = request.url.queryParameter("sortBy")?.toIntOrNull() ?: sortByIndex
-            sortByAscending = request.url.queryParameter("sortByAscending").toBoolean()
-            tagIncludeList = request.url.queryParameter("tagIncludeList").let { param ->
-                if (param is String && param.isNotEmpty()) {
-                    param.split(",").toMutableList()
-                } else {
-                    tagIncludeList
-                }
-            }
-            tagExcludeList = request.url.queryParameter("tagExcludeList").let { param ->
-                if (param is String && param.isNotEmpty()) {
-                    param.split(",").toMutableList()
-                } else {
-                    tagExcludeList
-                }
-            }
-            tagFilterIncludeModeIndex = request.url.queryParameter("tagFilterIncludeMode")?.toIntOrNull() ?: tagFilterIncludeModeIndex
-            tagFilterExcludeModeIndex = request.url.queryParameter("tagFilterExcludeMode")?.toIntOrNull() ?: tagFilterExcludeModeIndex
-            resultsPerPage = request.url.queryParameter("resultsPerPage")?.toIntOrNull() ?: resultsPerPage
-            page = request.url.queryParameter("page")?.toIntOrNull() ?: page
-        }
-        val sortByProperty = sortByOptions[sortByIndex]
-        val tagFilterIncludeMode = tagModes[tagFilterIncludeModeIndex]
-        val tagFilterExcludeMode = tagModes[tagFilterExcludeModeIndex]
-
-        // Get URLs of categories to search
-        val categoryUrlList = if (currentCategoryId == -1) {
-            categoryList.map { category -> "$checkedBaseUrl/api/v1/category/${category.id}" }
-        } else {
-            listOfNotNull("$checkedBaseUrl/api/v1/category/$currentCategoryId")
-        }
-
-        // Construct a list of all manga in the required categories by querying each one
-        val mangaList = mutableListOf<MangaDataClass>()
-        categoryUrlList.forEach { categoryUrl ->
-            val categoryMangaListRequest =
-                GET(categoryUrl, headers)
-            val categoryMangaListResponse =
-                client.newCall(categoryMangaListRequest).execute()
-            val categoryMangaListJson =
-                categoryMangaListResponse.body.string()
-            val categoryMangaList =
-                json.decodeFromString<List<MangaDataClass>>(categoryMangaListJson)
-            mangaList.addAll(categoryMangaList)
-        }
-
-        // Filter by tags
-        var searchResults = mangaList.toImmutableList()
-        val filterConfigs = mutableListOf<Triple<Boolean, String, List<String>>>()
-        if (tagExcludeList.isNotEmpty()) filterConfigs.add(Triple(false, tagFilterExcludeMode, tagExcludeList))
-        if (tagIncludeList.isNotEmpty()) filterConfigs.add(Triple(true, tagFilterIncludeMode, tagIncludeList))
-        filterConfigs.forEach { config ->
-            val isInclude = config.first
-            val filterMode = config.second
-            val filteredTagList = config.third
-            searchResults = searchResults.filter { mangaData ->
-                val lowerCaseTags = mangaData.genre.map { it.lowercase() }
-                val filterResult = when (filterMode) {
-                    tagModeAndString -> lowerCaseTags.containsAll(filteredTagList.map { tag -> tag.lowercase() })
-                    tagModeOrString -> lowerCaseTags.any { tag -> tag in filteredTagList.map { tag -> tag.lowercase() } }
-                    else -> false
-                }
-                if (isInclude) filterResult else !filterResult
-            }
-        }
-
-        // Filter according to search terms.
-        // Basic substring search, room for improvement.
-        searchResults = if (!searchQuery.isNullOrEmpty()) {
-            searchResults.filter { mangaData ->
-                val fieldsToCheck = listOfNotNull(
-                    mangaData.title,
-                    mangaData.url,
-                    mangaData.artist,
-                    mangaData.author,
-                    mangaData.description,
-                )
-                fieldsToCheck.any { field ->
-                    field.contains(searchQuery, ignoreCase = true)
-                }
-            }
-        } else {
-            searchResults
-        }.distinct()
-
-        // Sort results
-        searchResults = when (sortByProperty) {
-            "Title" -> searchResults.sortedBy { it.title }
-            "Artist" -> searchResults.sortedBy { it.artist }
-            "Author" -> searchResults.sortedBy { it.author }
-            "Date added" -> searchResults.sortedBy { it.inLibraryAt }
-            "Total chapters" -> searchResults.sortedBy { it.chapterCount }
-            else -> searchResults
-        }
-        if (!sortByAscending) {
-            searchResults = searchResults.asReversed()
-        }
-
-        // Get new list of tags from the search results
-        refreshTagList(searchResults)
-
-        // Paginate results
-        val hasNextPage: Boolean
-        with(paginateResults(searchResults, page, resultsPerPage)) {
-            searchResults = first
-            hasNextPage = second
-        }
-
-        return MangasPage(searchResults.map { mangaData -> mangaData.toSManga() }, hasNextPage)
-    }
-
-    // ------------- Images -------------
-    override fun imageRequest(page: Page) = GET(page.imageUrl!!, headers)
-
-    // ------------- Settings -------------
-
-    private val preferences: SharedPreferences by lazy {
-        Injekt.get<Application>().getSharedPreferences("source_$id", 0x0000)
-    }
-
-    init {
-        val preferencesMap = mapOf(
-            ADDRESS_TITLE to ADDRESS_DEFAULT,
-            LOGIN_TITLE to LOGIN_DEFAULT,
-            PASSWORD_TITLE to PASSWORD_DEFAULT,
+        duplicatePageHistory.recordChapter(
+            identity,
+            currentFingerprints.map { (position, fingerprint) -> IndexedValue(position, fingerprint) },
         )
-
-        preferencesMap.forEach { (key, defaultValue) ->
-            val initBase = preferences.getString(key, defaultValue)!!
-
-            if (initBase.isNotBlank()) {
-                refreshCategoryList(initBase)
+        val inspectedIndices = leadingScan.inspectedIndices + trailingScan.inspectedIndices
+        val duplicateIndices =
+            (leadingScan.duplicateIndices + trailingScan.duplicateIndices)
+                .takeUnless { it.size == pages.size }
+                .orEmpty()
+        inspectedIndices
+            .filterNot(duplicateIndices::contains)
+            .forEach { index ->
+                val page = pages[index]
+                val inspected = inspectedPages[index] ?: return@forEach
+                page.imageUrl?.let { prefetchedPageImages.put(it, inspected.image) }
             }
-        }
+
+        return reindexPages(pages, duplicateIndices)
     }
 
-    // ------------- Preferences -------------
-    override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        screen.addPreference(screen.editTextPreference(ADDRESS_TITLE, ADDRESS_DEFAULT, baseUrl, false, "i.e. http://192.168.1.115:4567"))
-        screen.addPreference(screen.editTextPreference(LOGIN_TITLE, LOGIN_DEFAULT, baseLogin, false, ""))
-        screen.addPreference(screen.editTextPreference(PASSWORD_TITLE, PASSWORD_DEFAULT, basePassword, true, ""))
-    }
-
-    /** boilerplate for [EditTextPreference] */
-    private fun PreferenceScreen.editTextPreference(title: String, default: String, value: String, isPassword: Boolean = false, placeholder: String): EditTextPreference {
-        return EditTextPreference(context).apply {
-            key = title
-            this.title = title
-            summary = value.ifEmpty { placeholder }
-            this.setDefaultValue(default)
-            dialogTitle = title
-
-            if (isPassword) {
-                setOnBindEditTextListener {
-                    it.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+    private fun inspectEdgePage(page: Page): InspectedEdgePage? =
+        try {
+            client.newCall(imageRequest(page)).execute().use { response ->
+                if (!response.isSuccessful || response.body.contentLength() > MAX_FINGERPRINT_IMAGE_BYTES) {
+                    return null
                 }
-            }
 
-            setOnPreferenceChangeListener { _, newValue ->
-                try {
-                    val res = preferences.edit().putString(title, newValue as String).commit()
-                    Toast.makeText(context, "Restart Tachiyomi to apply new setting.", Toast.LENGTH_LONG).show()
-                    res
-                } catch (e: Exception) {
-                    Log.e("Mangabat", "Exception while setting text preference", e)
-                    false
+                val body = response.body
+                val bytes = body.bytes()
+                if (bytes.size > MAX_FINGERPRINT_IMAGE_BYTES) {
+                    return null
                 }
-            }
-        }
-    }
 
-    private fun getPrefBaseUrl(): String = preferences.getString(ADDRESS_TITLE, ADDRESS_DEFAULT)!!
-    private fun getPrefBaseLogin(): String = preferences.getString(LOGIN_TITLE, LOGIN_DEFAULT)!!
-    private fun getPrefBasePassword(): String = preferences.getString(PASSWORD_TITLE, PASSWORD_DEFAULT)!!
+                InspectedEdgePage(
+                    fingerprint = createPageFingerprint(bytes),
+                    image = PrefetchedPageImage(bytes, body.contentType()?.toString()),
+                )
+            }
+        } catch (_: Exception) {
+            null
+        }
+
+    private fun String.toChapterDate(): Long =
+        runCatching {
+            val normalized = replace(Regex("""\.(\d{3})\d*Z$"""), ".$1Z")
+            chapterDateFormat.parse(normalized)?.time ?: 0L
+        }.getOrDefault(0L)
 
     companion object {
-        private const val ADDRESS_TITLE = "Server URL Address"
-        private const val ADDRESS_DEFAULT = "https://h.mangabat.com/"
-        private const val LOGIN_TITLE = "Login (Basic Auth)"
-        private const val LOGIN_DEFAULT = ""
-        private const val PASSWORD_TITLE = "Password (Basic Auth)"
-        private const val PASSWORD_DEFAULT = ""
+        internal const val MANGA_LIST_SELECTOR =
+            "div.truyen-list > div.list-truyen-item-wrap:has(a[data-id]), " +
+                "div.comic-list > .list-comic-item-wrap:has(a[data-id])"
+        private const val MIGRATE_MESSAGE = "Migrate this entry from \"Mangabat\" to \"Mangabat\" to continue reading"
+        private const val DUPLICATE_PAGE_HISTORY_NAMESPACE = "mangabat.leading_pages.v1"
+        private const val MAX_FINGERPRINT_IMAGE_BYTES = 16 * 1024 * 1024
+    }
+}
+
+@Serializable
+internal data class MangabatChapterResponse(
+    val data: MangabatChapterData,
+)
+
+@Serializable
+internal data class MangabatChapterData(
+    val chapters: List<MangabatChapter>,
+)
+
+@Serializable
+internal data class MangabatChapter(
+    @SerialName("chapter_name")
+    val name: String,
+    @SerialName("chapter_slug")
+    val slug: String,
+    @SerialName("updated_at")
+    val updatedAt: String,
+)
+
+private data class InspectedEdgePage(
+    val fingerprint: PageFingerprint,
+    val image: PrefetchedPageImage,
+)
+
+internal data class MangabatChapterLocation(
+    val seriesSlug: String,
+    val chapterSlug: String,
+)
+
+internal fun String.toMangabatChapterLocation(): MangabatChapterLocation? {
+    val pathSegments =
+        toHttpUrlOrNull()
+            ?.pathSegments
+            ?.filter(String::isNotBlank)
+            ?: return null
+    val mangaIndex = pathSegments.indexOf("manga")
+    val seriesSlug = pathSegments.getOrNull(mangaIndex + 1)?.takeIf(String::isNotBlank) ?: return null
+    val chapterSlug = pathSegments.getOrNull(mangaIndex + 2)?.takeIf(String::isNotBlank) ?: return null
+    return MangabatChapterLocation(seriesSlug, chapterSlug)
+}
+
+internal fun List<MangabatChapter>.adjacentChapterSlug(currentChapterSlug: String): String? {
+    val currentIndex = indexOfFirst { it.slug == currentChapterSlug }
+    if (currentIndex < 0) {
+        return null
+    }
+    return getOrNull(currentIndex + 1)?.slug ?: getOrNull(currentIndex - 1)?.slug
+}
+
+internal fun String.toMangabatPageIdentity(): LeadingPageIdentity? {
+    val pathSegments =
+        toHttpUrlOrNull()
+            ?.pathSegments
+            ?.filter(String::isNotBlank)
+            ?: return null
+    if (pathSegments.size < 3) {
+        return null
     }
 
-    // ------------- Not Used -------------
-
-    override fun latestUpdatesRequest(page: Int): Request = throw Exception("Not used")
-
-    override fun latestUpdatesParse(response: Response): MangasPage = throw Exception("Not used")
-
-    override fun pageListParse(response: Response): List<Page> = throw Exception("Not used")
-
-    override fun imageUrlParse(response: Response): String = throw Exception("Not used")
-
-    // ------------- Util -------------
-
-    private fun MangaDataClass.toSManga() = SManga.create().also {
-        it.url = id.toString()
-        it.title = title
-        it.thumbnail_url = "$baseUrl$thumbnailUrl"
-        it.artist = artist
-        it.author = author
-        it.description = description
-        it.genre = genre.joinToString(", ")
-        it.status = when (status) {
-            "ONGOING" -> SManga.ONGOING
-            "COMPLETED" -> SManga.COMPLETED
-            "LICENSED" -> SManga.LICENSED
-            else -> SManga.UNKNOWN // covers "UNKNOWN" and other Impossible cases
-        }
-    }
-
-    private fun ChapterDataClass.toSChapter() = SChapter.create().also {
-        it.url = "$mangaId $index"
-        it.name = name
-        it.date_upload = uploadDate
-        it.scanlator = scanlator
-    }
-
-    private val checkedBaseUrl: String
-        get(): String = baseUrl.ifEmpty { throw RuntimeException("Set Mangabat server url in extension settings") }
-
-    private fun paginateResults(mangaList: List<MangaDataClass>, page: Int?, itemsPerPage: Int?): Pair<List<MangaDataClass>, Boolean> {
-        var hasNextPage = false
-        val pageItems = if (mangaList.isNotEmpty() && itemsPerPage is Int && page is Int) {
-            val fromIndex = (page - 1) * itemsPerPage
-            val toIndex = min(fromIndex + itemsPerPage, mangaList.size)
-            hasNextPage = toIndex < mangaList.size
-            mangaList.subList(fromIndex, toIndex)
-        } else {
-            mangaList
-        }
-        return Pair(pageItems, hasNextPage)
-    }
+    val seriesKey = pathSegments.dropLast(2).joinToString("/")
+    val chapterKey = pathSegments[pathSegments.lastIndex - 1]
+    return LeadingPageIdentity(seriesKey, chapterKey)
 }

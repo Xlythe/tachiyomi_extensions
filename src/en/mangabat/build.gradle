@@ -6,7 +6,13 @@ ext {
     extName = 'Mangabat'
     pkgNameSuffix = 'en.mangabat'
     extClass = '.Mangabat'
-    extVersionCode = 1
+    extVersionCode = 26
+    isNsfw = true
 }
 
 apply from: "$rootDir/common.gradle"
+
+dependencies {
+    implementation(project(":lib-mangabox"))
+    testImplementation("junit:junit:4.13.2")
+}
