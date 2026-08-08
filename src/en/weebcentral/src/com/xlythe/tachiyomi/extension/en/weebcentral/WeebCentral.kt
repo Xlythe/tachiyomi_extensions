@@ -28,6 +28,7 @@ import keiyoushi.utils.reindexPages
 import keiyoushi.utils.scanLeadingDuplicates
 import keiyoushi.utils.scanTrailingDuplicates
 import keiyoushi.utils.trailingPagePosition
+import okhttp3.CacheControl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Request
@@ -423,7 +424,30 @@ class WeebCentral : ParsedHttpSource() {
             .forEach { index ->
                 val page = pages[index]
                 val inspected = inspectedPages[index] ?: return@forEach
-                page.imageUrl?.let { prefetchedPageImages.put(it, inspected.image) }
+                val oppositeEdgeReferences =
+                    if (index in leadingScan.inspectedIndices) {
+                        trailingScan.inspectedIndices
+                    } else {
+                        leadingScan.inspectedIndices
+                    }.mapNotNull(inspectedPages::get)
+                val edgeReferences = inspectedAdjacentPages.values + oppositeEdgeReferences
+                val inspectLeading = index in leadingScan.inspectedIndices
+                val inspectTrailing = index in trailingScan.inspectedIndices
+                val edit =
+                    inspected.stripProfile?.generalizedSeamEdit(
+                        signatures = inspected.edgeRegionSignatures,
+                        references = edgeReferences.flatMap(InspectedEdgePage::edgeRegionSignatures),
+                        inspectLeading = inspectLeading,
+                        inspectTrailing = inspectTrailing,
+                    )
+                val originalUrl = page.imageUrl ?: return@forEach
+                val bounds = edit?.cropBounds(inspected.fingerprint.width, inspected.fingerprint.height)
+                val croppedImage = bounds?.let { cropPageImage(inspected.originalImage.bytes, it) }
+                val servedUrl =
+                    croppedImage?.let { originalUrl.withWeebCentralEdgeCropCacheKey(requireNotNull(bounds)) }
+                        ?: originalUrl
+                page.imageUrl = servedUrl
+                prefetchedPageImages.put(servedUrl, croppedImage ?: inspected.originalImage)
             }
 
         return reindexPages(pages, duplicateIndices)
@@ -431,7 +455,7 @@ class WeebCentral : ParsedHttpSource() {
 
     private fun inspectEdgePage(page: Page): InspectedEdgePage? =
         try {
-            client.newCall(imageRequest(page)).execute().use { response ->
+            client.newCall(imageRequest(page).withFreshWeebCentralImageInspection()).execute().use { response ->
                 if (!response.isSuccessful || response.body.contentLength() > MAX_FINGERPRINT_IMAGE_BYTES) {
                     return null
                 }
@@ -443,21 +467,79 @@ class WeebCentral : ParsedHttpSource() {
                 }
 
                 val fingerprint = createPageFingerprint(bytes)
-                val edit = fingerprint.sha256.toWeebCentralEdgePageEdit()
-                val originalImage = PrefetchedPageImage(bytes, body.contentType()?.toString())
+                val stripProfile = createEdgeStripProfile(bytes, fingerprint.width, fingerprint.height)
                 InspectedEdgePage(
                     fingerprint = fingerprint,
-                    image =
-                    edit?.cropBounds(fingerprint.width, fingerprint.height)
-                        ?.let { bounds -> cropPageImage(bytes, bounds) }
-                        ?: originalImage,
-                    forceExclude = edit?.remove == true,
+                    originalImage = PrefetchedPageImage(bytes, body.contentType()?.toString()),
+                    stripProfile = stripProfile,
+                    edgeRegionSignatures =
+                    stripProfile?.let { createEdgeRegionSignatures(bytes, it) }.orEmpty(),
+                    forceExclude =
+                    isStructurallyInvalidWeebCentralEdgeImage(fingerprint.width, fingerprint.height),
                 )
             }
         } catch (_: Exception) {
             null
         }
 
+    private fun createEdgeStripProfile(
+        bytes: ByteArray,
+        width: Int,
+        height: Int,
+    ): WeebCentralEdgeStripProfile? {
+        if (width <= 0 || height <= 0) return null
+        val source = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return null
+        var scaled: Bitmap? = null
+        return try {
+            val scaledHeight = maxOf(1, (height * EDGE_STRIP_PROFILE_WIDTH + width / 2) / width)
+            scaled = Bitmap.createScaledBitmap(source, EDGE_STRIP_PROFILE_WIDTH, scaledHeight, true)
+            val pixels = IntArray(EDGE_STRIP_PROFILE_WIDTH * scaledHeight)
+            scaled.getPixels(pixels, 0, EDGE_STRIP_PROFILE_WIDTH, 0, 0, EDGE_STRIP_PROFILE_WIDTH, scaledHeight)
+            val luma =
+                ByteArray(pixels.size) { index ->
+                    val color = pixels[index]
+                    val red = color shr 16 and 0xFF
+                    val green = color shr 8 and 0xFF
+                    val blue = color and 0xFF
+                    ((red * 299 + green * 587 + blue * 114) / 1000).toByte()
+                }
+            WeebCentralEdgeStripProfile(width, height, scaledHeight, luma)
+        } finally {
+            if (scaled !== source) scaled?.recycle()
+            source.recycle()
+        }
+    }
+
+    private fun createEdgeRegionSignatures(
+        bytes: ByteArray,
+        profile: WeebCentralEdgeStripProfile,
+    ): List<WeebCentralEdgeRegionSignature> {
+        val source = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return emptyList()
+        return try {
+            buildList {
+                listOf(true, false).forEach { fromTop ->
+                    profile.strongEdgeBoundaryRows(fromTop).forEach { edgeRows ->
+                        val approximateHeight = profile.normalizedRowsToPixels(edgeRows)
+                        val pixelHeight = source.refineEdgeBoundary(approximateHeight, fromTop)
+                        val top = if (fromTop) 0 else source.height - pixelHeight
+                        source.blockAverageHash(top, pixelHeight)?.let { hash ->
+                            add(
+                                WeebCentralEdgeRegionSignature(
+                                    edgeRows,
+                                    pixelHeight,
+                                    fromTop,
+                                    hash,
+                                    profile.edgeBoundaryMeanDifference(edgeRows, fromTop),
+                                ),
+                            )
+                        }
+                    }
+                }
+            }
+        } finally {
+            source.recycle()
+        }
+    }
     private fun cropPageImage(
         bytes: ByteArray,
         bounds: WeebCentralCropBounds,
@@ -504,17 +586,236 @@ class WeebCentral : ParsedHttpSource() {
 
         private const val DUPLICATE_PAGE_HISTORY_NAMESPACE = "weebcentral.leading_pages.v1"
         private const val MAX_FINGERPRINT_IMAGE_BYTES = 16 * 1024 * 1024
+        private const val EDGE_STRIP_PROFILE_WIDTH = 32
     }
 }
 
 private data class InspectedEdgePage(
     val fingerprint: PageFingerprint,
-    val image: PrefetchedPageImage,
+    val originalImage: PrefetchedPageImage,
+    val stripProfile: WeebCentralEdgeStripProfile?,
+    val edgeRegionSignatures: List<WeebCentralEdgeRegionSignature>,
     val forceExclude: Boolean,
 )
 
-internal fun String.isKnownWeebCentralEdgeAdvertisement(): Boolean =
-    toWeebCentralEdgePageEdit()?.remove == true
+internal fun Request.withFreshWeebCentralImageInspection(): Request =
+    newBuilder()
+        .url(
+            url.newBuilder()
+                .setQueryParameter(WEEBCENTRAL_EDGE_INSPECTION_QUERY_PARAMETER, "v1")
+                .build(),
+        )
+        .cacheControl(CacheControl.FORCE_NETWORK)
+        .build()
+
+internal data class WeebCentralEdgeStripProfile(
+    val originalWidth: Int,
+    val originalHeight: Int,
+    val heightRows: Int,
+    val luma: ByteArray,
+) {
+    val profileWidth: Int
+        get() = if (heightRows > 0) luma.size / heightRows else 0
+}
+
+internal data class WeebCentralEdgeRegionSignature(
+    val edgeRows: Int,
+    val edgePixels: Int,
+    val fromTop: Boolean,
+    val hash: ByteArray,
+    val seamMeanDifference: Int = Int.MAX_VALUE,
+) {
+    fun isDuplicateOf(other: WeebCentralEdgeRegionSignature): Boolean {
+        if (
+            kotlin.math.abs(edgeRows - other.edgeRows) > MAXIMUM_EDGE_SIGNATURE_ROW_DELTA ||
+            hash.size != other.hash.size
+        ) {
+            return false
+        }
+        val maximumDistance =
+            if (minOf(seamMeanDifference, other.seamMeanDifference) >= MINIMUM_STRONG_EDGE_SEAM_MEAN_DIFFERENCE) {
+                MAXIMUM_EDGE_SIGNATURE_DISTANCE
+            } else {
+                MAXIMUM_WEAK_EDGE_SIGNATURE_DISTANCE
+            }
+        var distance = 0
+        for (index in hash.indices) {
+            if (hash[index] != other.hash[index] && ++distance > maximumDistance) {
+                return false
+            }
+        }
+        return true
+    }
+}
+
+internal fun isStructurallyInvalidWeebCentralEdgeImage(
+    width: Int,
+    height: Int,
+): Boolean = width <= 1 || height <= 1
+
+internal fun WeebCentralEdgeStripProfile.generalizedSeamEdit(
+    signatures: List<WeebCentralEdgeRegionSignature>,
+    references: List<WeebCentralEdgeRegionSignature>,
+    inspectLeading: Boolean,
+    inspectTrailing: Boolean,
+): WeebCentralEdgePageEdit? {
+    fun matchingPixels(fromTop: Boolean): Int =
+        signatures
+            .asSequence()
+            .filter { it.fromTop == fromTop }
+            .filter { candidate -> references.any(candidate::isDuplicateOf) }
+            .maxOfOrNull(WeebCentralEdgeRegionSignature::edgePixels)
+            ?: 0
+
+    var topPixels = if (inspectLeading) matchingPixels(fromTop = true) else 0
+    var bottomPixels = if (inspectTrailing) matchingPixels(fromTop = false) else 0
+    val minimumRetainedHeight = maxOf(originalWidth / 3, MINIMUM_RETAINED_EDGE_PIXELS)
+    if (originalHeight - topPixels - bottomPixels < minimumRetainedHeight) {
+        if (topPixels >= bottomPixels && originalHeight - topPixels >= minimumRetainedHeight) {
+            bottomPixels = 0
+        } else if (originalHeight - bottomPixels >= minimumRetainedHeight) {
+            topPixels = 0
+        } else {
+            return null
+        }
+    }
+    if (topPixels == 0 && bottomPixels == 0) return null
+    return WeebCentralEdgePageEdit(
+        topOffset = topPixels,
+        retainedHeight = bottomPixels.takeIf { it > 0 }?.let { originalHeight - topPixels - it },
+    )
+}
+
+internal fun WeebCentralEdgeStripProfile.strongEdgeBoundaryRows(fromTop: Boolean): List<Int> {
+    val maximumRows =
+        minOf(
+            profileWidth * MAXIMUM_EDGE_WIDTH_MULTIPLIER,
+            heightRows * MAXIMUM_EDGE_CROP_NUMERATOR / MAXIMUM_EDGE_CROP_DENOMINATOR,
+        )
+    if (maximumRows < MINIMUM_REPEATED_EDGE_ROWS) return emptyList()
+    return (MINIMUM_REPEATED_EDGE_ROWS..maximumRows).filter { edgeRows ->
+        val boundaryRow = if (fromTop) edgeRows else heightRows - edgeRows
+        val startRow = if (fromTop) 0 else heightRows - edgeRows
+        boundaryRow > 0 &&
+            boundaryRow < heightRows &&
+            hasVisualDetail(startRow, edgeRows) &&
+            horizontalRowDifference(boundaryRow - 1, boundaryRow) >=
+                MINIMUM_EDGE_SEAM_MEAN_DIFFERENCE * profileWidth
+    }
+}
+
+private fun WeebCentralEdgeStripProfile.edgeBoundaryMeanDifference(
+    edgeRows: Int,
+    fromTop: Boolean,
+): Int {
+    val boundaryRow = if (fromTop) edgeRows else heightRows - edgeRows
+    if (profileWidth <= 0 || boundaryRow <= 0 || boundaryRow >= heightRows) return 0
+    return (horizontalRowDifference(boundaryRow - 1, boundaryRow) / profileWidth).toInt()
+}
+
+private fun WeebCentralEdgeStripProfile.hasVisualDetail(
+    startRow: Int,
+    rows: Int,
+): Boolean {
+    var minimum = 255
+    var maximum = 0
+    val start = startRow * profileWidth
+    val end = (startRow + rows) * profileWidth
+    for (index in start until end) {
+        val value = luma[index].toInt() and 0xFF
+        minimum = minOf(minimum, value)
+        maximum = maxOf(maximum, value)
+    }
+    return maximum - minimum >= MINIMUM_EDGE_LUMA_RANGE
+}
+
+private fun WeebCentralEdgeStripProfile.horizontalRowDifference(
+    firstRow: Int,
+    secondRow: Int,
+): Long {
+    var difference = 0L
+    val firstStart = firstRow * profileWidth
+    val secondStart = secondRow * profileWidth
+    for (column in 0 until profileWidth) {
+        val first = luma[firstStart + column].toInt() and 0xFF
+        val second = luma[secondStart + column].toInt() and 0xFF
+        difference += kotlin.math.abs(first - second)
+    }
+    return difference
+}
+
+internal fun WeebCentralEdgeStripProfile.normalizedRowsToPixels(rows: Int): Int =
+    if (rows <= 0) 0 else (rows * originalWidth + profileWidth - 1) / profileWidth
+
+private fun Bitmap.refineEdgeBoundary(
+    approximateHeight: Int,
+    fromTop: Boolean,
+): Int {
+    val radius = maxOf(4, width / 32)
+    val minimum = maxOf(1, approximateHeight - radius)
+    val maximum = minOf(height - 1, approximateHeight + radius)
+    var bestHeight = approximateHeight.coerceIn(minimum, maximum)
+    var bestDifference = -1L
+    val sampleStep = maxOf(1, width / 256)
+    for (edgePixels in minimum..maximum) {
+        val boundaryY = if (fromTop) edgePixels else height - edgePixels
+        if (boundaryY <= 0 || boundaryY >= height) continue
+        var difference = 0L
+        for (x in 0 until width step sampleStep) {
+            val first = getPixel(x, boundaryY - 1).weebCentralLuminance()
+            val second = getPixel(x, boundaryY).weebCentralLuminance()
+            difference += kotlin.math.abs(first - second)
+        }
+        if (difference > bestDifference) {
+            bestDifference = difference
+            bestHeight = edgePixels
+        }
+    }
+    return bestHeight
+}
+
+private fun Int.weebCentralLuminance(): Int =
+    (
+        (this shr 16 and 0xFF) * 299 +
+            (this shr 8 and 0xFF) * 587 +
+            (this and 0xFF) * 114
+        ) / 1000
+private fun Bitmap.blockAverageHash(top: Int, height: Int): ByteArray? {
+    if (top < 0 || height <= 0 || top + height > this.height || width <= 0) return null
+    val pixels = IntArray(width * height)
+    getPixels(pixels, 0, width, 0, top, width, height)
+    val averages = LongArray(EDGE_SIGNATURE_GRID_SIZE * EDGE_SIGNATURE_GRID_SIZE)
+    var total = 0L
+    for (gridY in 0 until EDGE_SIGNATURE_GRID_SIZE) {
+        val yStart = gridY * height / EDGE_SIGNATURE_GRID_SIZE
+        val yEnd = (gridY + 1) * height / EDGE_SIGNATURE_GRID_SIZE
+        for (gridX in 0 until EDGE_SIGNATURE_GRID_SIZE) {
+            val xStart = gridX * width / EDGE_SIGNATURE_GRID_SIZE
+            val xEnd = (gridX + 1) * width / EDGE_SIGNATURE_GRID_SIZE
+            var sum = 0L
+            var count = 0
+            for (y in yStart until yEnd) {
+                for (x in xStart until xEnd) {
+                    val color = pixels[y * width + x]
+                    sum +=
+                        (
+                        (color shr 16 and 0xFF) * 299 +
+                            (color shr 8 and 0xFF) * 587 +
+                            (color and 0xFF) * 114
+                        ) / 1000
+                    count++
+                }
+            }
+            if (count == 0) return null
+            val index = gridY * EDGE_SIGNATURE_GRID_SIZE + gridX
+            averages[index] = sum / count
+            total += averages[index]
+        }
+    }
+    return ByteArray(averages.size) { index ->
+        if (averages[index] * averages.size > total) 1 else 0
+    }
+}
 
 internal data class WeebCentralCropBounds(
     val x: Int,
@@ -524,45 +825,50 @@ internal data class WeebCentralCropBounds(
 )
 
 internal data class WeebCentralEdgePageEdit(
-    val remove: Boolean = false,
+    val topOffset: Int = 0,
     val retainedHeight: Int? = null,
 ) {
     fun cropBounds(
         imageWidth: Int,
         imageHeight: Int,
     ): WeebCentralCropBounds? {
-        if (remove || retainedHeight == null) {
-            return null
-        }
-
-        return WeebCentralCropBounds(0, 0, imageWidth, retainedHeight)
+        if (topOffset == 0 && retainedHeight == null) return null
+        val height = retainedHeight ?: (imageHeight - topOffset)
+        return WeebCentralCropBounds(0, topOffset, imageWidth, height)
             .takeIf {
                 imageWidth > 0 &&
-                    retainedHeight > 0 &&
-                    retainedHeight <= imageHeight
+                    topOffset >= 0 &&
+                    height > 0 &&
+                    topOffset + height <= imageHeight
             }
     }
 }
 
-internal fun String.toWeebCentralEdgePageEdit(): WeebCentralEdgePageEdit? =
-    KNOWN_WEEBCENTRAL_EDGE_PAGE_EDITS[lowercase(Locale.ROOT)]
+internal fun String.withWeebCentralEdgeCropCacheKey(bounds: WeebCentralCropBounds): String =
+    toHttpUrlOrNull()
+        ?.newBuilder()
+        ?.setQueryParameter(
+            WEEBCENTRAL_EDGE_CROP_QUERY_PARAMETER,
+            "v1-${bounds.x}-${bounds.y}-${bounds.width}-${bounds.height}",
+        )
+        ?.build()
+        ?.toString()
+        ?: this
 
-private val KNOWN_WEEBCENTRAL_EDGE_PAGE_EDITS =
-    mapOf(
-        // Return of the Blossoming Blade, episode 174: scan-group chapter card.
-        "016b118d4abb89b33d7830749676dcf582a4be474af51c31d9d51504784f957b" to
-            WeebCentralEdgePageEdit(remove = true),
-        // Return of the Blossoming Blade, episode 174: full-page "read at" promotion.
-        "cc954b73e82b3012cad24ba9ca15718a7aa324eb7de26245157e7ee5d5fb537f" to
-            WeebCentralEdgePageEdit(remove = true),
-        // Eleceed, chapter 412: one-pixel placeholder between real chapter pages.
-        "de1aecd3348fc5abe6900f2ec9a28728e32bddcd6ac8471e603c0f8ab74260af" to
-            WeebCentralEdgePageEdit(remove = true),
-        // Preserve the final art and staff credits, cutting only the HiveToon footer ad.
-        "d5e4f1808a80f676dc43c679a8aaaefd87fbaee118f7b7543d1dc73cdda1c378" to
-            WeebCentralEdgePageEdit(retainedHeight = 1170),
-    )
-
+private const val EDGE_SIGNATURE_GRID_SIZE = 16
+private const val MAXIMUM_EDGE_SIGNATURE_DISTANCE = 72
+private const val MAXIMUM_WEAK_EDGE_SIGNATURE_DISTANCE = 24
+private const val MAXIMUM_EDGE_SIGNATURE_ROW_DELTA = 4
+private const val MINIMUM_EDGE_SEAM_MEAN_DIFFERENCE = 12L
+private const val MINIMUM_STRONG_EDGE_SEAM_MEAN_DIFFERENCE = 24
+private const val MINIMUM_REPEATED_EDGE_ROWS = 8
+private const val MINIMUM_EDGE_LUMA_RANGE = 48
+private const val MAXIMUM_EDGE_WIDTH_MULTIPLIER = 2
+private const val MAXIMUM_EDGE_CROP_NUMERATOR = 2
+private const val MAXIMUM_EDGE_CROP_DENOMINATOR = 3
+private const val MINIMUM_RETAINED_EDGE_PIXELS = 256
+private const val WEEBCENTRAL_EDGE_INSPECTION_QUERY_PARAMETER = "tachiyomi_edge_inspection"
+private const val WEEBCENTRAL_EDGE_CROP_QUERY_PARAMETER = "tachiyomi_edge_crop"
 private val WEEBCENTRAL_ADJACENT_CHAPTER_REGEX =
     """window\.location\.href\s*=\s*"(https://weebcentral\.com/chapters/([0-9A-Z]+)(?:\?is_prev=True)?)""""
         .toRegex()

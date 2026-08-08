@@ -211,36 +211,101 @@ class WeebCentralTest {
     }
 
     @Test
-    fun `Return of the Blossoming Blade episode 174 removes only exact edge ads`() {
-        assertTrue(
-            "016b118d4abb89b33d7830749676dcf582a4be474af51c31d9d51504784f957b"
-                .isKnownWeebCentralEdgeAdvertisement(),
+    fun `one pixel edge placeholders are removed structurally`() {
+        assertTrue(isStructurallyInvalidWeebCentralEdgeImage(width = 800, height = 1))
+        assertTrue(isStructurallyInvalidWeebCentralEdgeImage(width = 1, height = 1537))
+        assertFalse(isStructurallyInvalidWeebCentralEdgeImage(width = 800, height = 25))
+    }
+
+    @Test
+    fun `matching seam signatures crop a footer while preserving credits`() {
+        val profile =
+            WeebCentralEdgeStripProfile(
+                originalWidth = 800,
+                originalHeight = 1537,
+                heightRows = 61,
+                luma = ByteArray(61 * 32),
+            )
+        val candidateHash = ByteArray(256) { (it % 2).toByte() }
+        val matchingHash = candidateHash.copyOf().apply {
+            repeat(70) { index -> this[index] = (1 - this[index]).toByte() }
+        }
+        val unrelatedHash = candidateHash.copyOf().apply {
+            repeat(73) { index -> this[index] = (1 - this[index]).toByte() }
+        }
+        val candidate =
+            WeebCentralEdgeRegionSignature(
+                edgeRows = 15,
+                edgePixels = 367,
+                fromTop = false,
+                hash = candidateHash,
+            )
+
+        val edit =
+            profile.generalizedSeamEdit(
+                signatures = listOf(candidate),
+                references =
+                listOf(
+                    WeebCentralEdgeRegionSignature(15, 365, true, matchingHash),
+                ),
+                inspectLeading = false,
+                inspectTrailing = true,
+            )
+        val rejected =
+            profile.generalizedSeamEdit(
+                signatures = listOf(candidate),
+                references =
+                listOf(
+                    WeebCentralEdgeRegionSignature(15, 367, true, unrelatedHash),
+                ),
+                inspectLeading = false,
+                inspectTrailing = true,
+            )
+
+        assertEquals(
+            WeebCentralCropBounds(x = 0, y = 0, width = 800, height = 1170),
+            edit?.cropBounds(imageWidth = 800, imageHeight = 1537),
         )
-        assertTrue(
-            "CC954B73E82B3012CAD24BA9CA15718A7AA324EB7DE26245157E7EE5D5FB537F"
-                .isKnownWeebCentralEdgeAdvertisement(),
-        )
-        assertFalse(
-            "674ac0d41fc73de799ece36b0ee5b817ba7137e1d87b1778da716a731db1512c"
-                .isKnownWeebCentralEdgeAdvertisement(),
+        assertEquals(null, rejected)
+    }
+
+    @Test
+    fun `matching seam signatures crop repeated headers`() {
+        val profile =
+            WeebCentralEdgeStripProfile(
+                originalWidth = 800,
+                originalHeight = 1400,
+                heightRows = 56,
+                luma = ByteArray(56 * 32),
+            )
+        val hash = ByteArray(256) { (it % 3).toByte() }
+        val signature = WeebCentralEdgeRegionSignature(16, 400, true, hash)
+
+        val edit =
+            profile.generalizedSeamEdit(
+                signatures = listOf(signature),
+                references = listOf(signature.copy(fromTop = false)),
+                inspectLeading = true,
+                inspectTrailing = false,
+            )
+
+        assertEquals(
+            WeebCentralCropBounds(x = 0, y = 400, width = 800, height = 1000),
+            edit?.cropBounds(imageWidth = 800, imageHeight = 1400),
         )
     }
 
     @Test
-    fun `Eleceed chapter 412 removes placeholder and crops only footer ad`() {
-        val placeholder =
-            "de1aecd3348fc5abe6900f2ec9a28728e32bddcd6ac8471e603c0f8ab74260af"
-                .toWeebCentralEdgePageEdit()
-        val mixedFinalPage =
-            "d5e4f1808a80f676dc43c679a8aaaefd87fbaee118f7b7543d1dc73cdda1c378"
-                .toWeebCentralEdgePageEdit()
+    fun `inspection and transformed pages use isolated cache urls`() {
+        val request = okhttp3.Request.Builder().url("https://example.org/page.webp").build()
+        val fresh = request.withFreshWeebCentralImageInspection()
+        val bounds = WeebCentralCropBounds(0, 0, 800, 1170)
+        val transformed = request.url.toString().withWeebCentralEdgeCropCacheKey(bounds)
 
-        assertEquals(true, placeholder?.remove)
-        assertEquals(
-            WeebCentralCropBounds(x = 0, y = 0, width = 800, height = 1170),
-            mixedFinalPage?.cropBounds(imageWidth = 800, imageHeight = 1537),
-        )
-        assertEquals(null, "changed-content".toWeebCentralEdgePageEdit())
+        assertTrue(fresh.cacheControl.noCache)
+        assertEquals("v1", fresh.url.queryParameter("tachiyomi_edge_inspection"))
+        assertTrue(transformed.contains("tachiyomi_edge_crop=v1-0-0-800-1170"))
+        assertFalse(transformed == request.url.toString())
     }
 
     @Test

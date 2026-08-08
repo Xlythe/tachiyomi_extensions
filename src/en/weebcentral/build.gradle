@@ -6,7 +6,7 @@ ext {
     extName = 'Weeb Central'
     pkgNameSuffix = 'en.weebcentral'
     extClass = '.WeebCentral'
-    extVersionCode = 19
+    extVersionCode = 22
     isNsfw = true
 }
 
