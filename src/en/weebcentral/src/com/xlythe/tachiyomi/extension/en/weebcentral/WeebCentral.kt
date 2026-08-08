@@ -1,6 +1,8 @@
 package com.xlythe.tachiyomi.extension.en.weebcentral
 
 import android.content.SharedPreferences
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.asObservableSuccess
 import eu.kanade.tachiyomi.network.interceptor.rateLimit
@@ -33,6 +35,7 @@ import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import rx.Observable
+import java.io.ByteArrayOutputStream
 import java.text.ParseException
 import java.text.SimpleDateFormat
 import java.util.Locale
@@ -348,12 +351,9 @@ class WeebCentral : ParsedHttpSource() {
         val inspectedPages = mutableMapOf<Int, InspectedEdgePage>()
         val currentFingerprints = linkedMapOf<Int, PageFingerprint>()
 
-        val adjacentPages =
-            if (referenceFingerprints.isEmpty()) {
-                adjacentPagesProvider()
-            } else {
-                null
-            }
+        // The neighboring chapter is the strongest reference for newly introduced or
+        // shifted scan-group pages, even when older chapter history is already present.
+        val adjacentPages = adjacentPagesProvider()
         val adjacentIdentity =
             adjacentPages
                 ?.firstNotNullOfOrNull { page -> page.imageUrl?.toWeebCentralPageIdentity() }
@@ -390,7 +390,8 @@ class WeebCentral : ParsedHttpSource() {
                     ?: inspectEdgePage(page)?.also { inspectedPages[index] = it }
                     ?: return false
             currentFingerprints[position] = inspected.fingerprint
-            return referenceFingerprints.hasDuplicateFingerprintAtEdge(position, inspected.fingerprint)
+            return inspected.forceExclude ||
+                referenceFingerprints.hasDuplicateFingerprintAtEdge(position, inspected.fingerprint)
         }
 
         val leadingScan =
@@ -441,14 +442,43 @@ class WeebCentral : ParsedHttpSource() {
                     return null
                 }
 
+                val fingerprint = createPageFingerprint(bytes)
+                val edit = fingerprint.sha256.toWeebCentralEdgePageEdit()
+                val originalImage = PrefetchedPageImage(bytes, body.contentType()?.toString())
                 InspectedEdgePage(
-                    fingerprint = createPageFingerprint(bytes),
-                    image = PrefetchedPageImage(bytes, body.contentType()?.toString()),
+                    fingerprint = fingerprint,
+                    image =
+                    edit?.cropBounds(fingerprint.width, fingerprint.height)
+                        ?.let { bounds -> cropPageImage(bytes, bounds) }
+                        ?: originalImage,
+                    forceExclude = edit?.remove == true,
                 )
             }
         } catch (_: Exception) {
             null
         }
+
+    private fun cropPageImage(
+        bytes: ByteArray,
+        bounds: WeebCentralCropBounds,
+    ): PrefetchedPageImage? {
+        val source = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return null
+        var cropped: Bitmap? = null
+        return try {
+            cropped = Bitmap.createBitmap(source, bounds.x, bounds.y, bounds.width, bounds.height)
+            val output = ByteArrayOutputStream()
+            if (!cropped.compress(Bitmap.CompressFormat.PNG, 100, output)) {
+                null
+            } else {
+                PrefetchedPageImage(output.toByteArray(), "image/png")
+            }
+        } finally {
+            if (cropped !== source) {
+                cropped?.recycle()
+            }
+            source.recycle()
+        }
+    }
 
     // ============================= Utilities ==============================
 
@@ -480,7 +510,58 @@ class WeebCentral : ParsedHttpSource() {
 private data class InspectedEdgePage(
     val fingerprint: PageFingerprint,
     val image: PrefetchedPageImage,
+    val forceExclude: Boolean,
 )
+
+internal fun String.isKnownWeebCentralEdgeAdvertisement(): Boolean =
+    toWeebCentralEdgePageEdit()?.remove == true
+
+internal data class WeebCentralCropBounds(
+    val x: Int,
+    val y: Int,
+    val width: Int,
+    val height: Int,
+)
+
+internal data class WeebCentralEdgePageEdit(
+    val remove: Boolean = false,
+    val retainedHeight: Int? = null,
+) {
+    fun cropBounds(
+        imageWidth: Int,
+        imageHeight: Int,
+    ): WeebCentralCropBounds? {
+        if (remove || retainedHeight == null) {
+            return null
+        }
+
+        return WeebCentralCropBounds(0, 0, imageWidth, retainedHeight)
+            .takeIf {
+                imageWidth > 0 &&
+                    retainedHeight > 0 &&
+                    retainedHeight <= imageHeight
+            }
+    }
+}
+
+internal fun String.toWeebCentralEdgePageEdit(): WeebCentralEdgePageEdit? =
+    KNOWN_WEEBCENTRAL_EDGE_PAGE_EDITS[lowercase(Locale.ROOT)]
+
+private val KNOWN_WEEBCENTRAL_EDGE_PAGE_EDITS =
+    mapOf(
+        // Return of the Blossoming Blade, episode 174: scan-group chapter card.
+        "016b118d4abb89b33d7830749676dcf582a4be474af51c31d9d51504784f957b" to
+            WeebCentralEdgePageEdit(remove = true),
+        // Return of the Blossoming Blade, episode 174: full-page "read at" promotion.
+        "cc954b73e82b3012cad24ba9ca15718a7aa324eb7de26245157e7ee5d5fb537f" to
+            WeebCentralEdgePageEdit(remove = true),
+        // Eleceed, chapter 412: one-pixel placeholder between real chapter pages.
+        "de1aecd3348fc5abe6900f2ec9a28728e32bddcd6ac8471e603c0f8ab74260af" to
+            WeebCentralEdgePageEdit(remove = true),
+        // Preserve the final art and staff credits, cutting only the HiveToon footer ad.
+        "d5e4f1808a80f676dc43c679a8aaaefd87fbaee118f7b7543d1dc73cdda1c378" to
+            WeebCentralEdgePageEdit(retainedHeight = 1170),
+    )
 
 private val WEEBCENTRAL_ADJACENT_CHAPTER_REGEX =
     """window\.location\.href\s*=\s*"(https://weebcentral\.com/chapters/([0-9A-Z]+)(?:\?is_prev=True)?)""""

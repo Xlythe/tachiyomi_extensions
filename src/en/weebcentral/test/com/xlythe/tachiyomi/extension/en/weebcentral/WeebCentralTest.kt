@@ -209,4 +209,44 @@ class WeebCentralTest {
 
         assertEquals("Sakamoto Days", detail.weebCentralTitle("h1"))
     }
+
+    @Test
+    fun `Return of the Blossoming Blade episode 174 removes only exact edge ads`() {
+        assertTrue(
+            "016b118d4abb89b33d7830749676dcf582a4be474af51c31d9d51504784f957b"
+                .isKnownWeebCentralEdgeAdvertisement(),
+        )
+        assertTrue(
+            "CC954B73E82B3012CAD24BA9CA15718A7AA324EB7DE26245157E7EE5D5FB537F"
+                .isKnownWeebCentralEdgeAdvertisement(),
+        )
+        assertFalse(
+            "674ac0d41fc73de799ece36b0ee5b817ba7137e1d87b1778da716a731db1512c"
+                .isKnownWeebCentralEdgeAdvertisement(),
+        )
+    }
+
+    @Test
+    fun `Eleceed chapter 412 removes placeholder and crops only footer ad`() {
+        val placeholder =
+            "de1aecd3348fc5abe6900f2ec9a28728e32bddcd6ac8471e603c0f8ab74260af"
+                .toWeebCentralEdgePageEdit()
+        val mixedFinalPage =
+            "d5e4f1808a80f676dc43c679a8aaaefd87fbaee118f7b7543d1dc73cdda1c378"
+                .toWeebCentralEdgePageEdit()
+
+        assertEquals(true, placeholder?.remove)
+        assertEquals(
+            WeebCentralCropBounds(x = 0, y = 0, width = 800, height = 1170),
+            mixedFinalPage?.cropBounds(imageWidth = 800, imageHeight = 1537),
+        )
+        assertEquals(null, "changed-content".toWeebCentralEdgePageEdit())
+    }
+
+    @Test
+    fun `stale WeebCentral crop coordinates fail closed`() {
+        val edit = WeebCentralEdgePageEdit(retainedHeight = 1600)
+
+        assertEquals(null, edit.cropBounds(imageWidth = 800, imageHeight = 1537))
+    }
 }

@@ -6,7 +6,7 @@ ext {
     extName = 'Mangabat'
     pkgNameSuffix = 'en.mangabat'
     extClass = '.Mangabat'
-    extVersionCode = 26
+    extVersionCode = 32
     isNsfw = true
 }
 
