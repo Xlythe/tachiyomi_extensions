@@ -153,6 +153,40 @@ class WeebCentralTest {
     }
 
     @Test
+    fun `landscape templates ignore changing chapter number in the center`() {
+        val reference = templateSignature(width = 1200, height = 800, center = 2)
+        val changedChapter = templateSignature(width = 1200, height = 800, center = 14)
+
+        assertTrue(reference.isDuplicateOf(changedChapter))
+    }
+
+    @Test
+    fun `template matcher rejects vertical pages and changed perimeter`() {
+        val reference = templateSignature(width = 1200, height = 800, center = 2)
+        val changedPerimeter = templateSignature(width = 1200, height = 800, center = 2, perimeter = 8)
+        val vertical = templateSignature(width = 900, height = 16000, center = 2)
+
+        assertFalse(reference.isDuplicateOf(changedPerimeter))
+        assertFalse(reference.isDuplicateOf(vertical))
+    }
+
+    private fun templateSignature(
+        width: Int,
+        height: Int,
+        center: Int,
+        perimeter: Int = 1,
+    ): WeebCentralTemplateSignature =
+        WeebCentralTemplateSignature(
+            width,
+            height,
+            ByteArray(32 * 32) { index ->
+                val row = index / 32
+                val column = index % 32
+                if (row < 8 || row >= 24 || column < 8 || column >= 24) perimeter.toByte() else center.toByte()
+            },
+        )
+
+    @Test
     fun `WeebCentral image urls are scoped by series and chapter`() {
         val identity =
             "https://scans.lastation.us/manga/the-extras-academy-survival-guide/0116-001.png"
@@ -270,6 +304,15 @@ class WeebCentralTest {
     }
 
     @Test
+    fun `matching seam signatures accept inverted scan group themes`() {
+        val hash = ByteArray(256) { (it % 3).let { value -> if (value == 0) 1 else 0 }.toByte() }
+        val inverted = ByteArray(hash.size) { index -> (1 - hash[index]).toByte() }
+        val candidate = WeebCentralEdgeRegionSignature(20, 1500, true, hash, seamMeanDifference = 30)
+
+        assertTrue(candidate.isDuplicateOf(candidate.copy(hash = inverted)))
+    }
+
+    @Test
     fun `matching seam signatures crop repeated headers`() {
         val profile =
             WeebCentralEdgeStripProfile(
@@ -304,7 +347,7 @@ class WeebCentralTest {
 
         assertTrue(fresh.cacheControl.noCache)
         assertEquals("v1", fresh.url.queryParameter("tachiyomi_edge_inspection"))
-        assertTrue(transformed.contains("tachiyomi_edge_crop=v1-0-0-800-1170"))
+        assertTrue(transformed.contains("tachiyomi_edge_crop=v4-0-0-800-1170"))
         assertFalse(transformed == request.url.toString())
     }
 

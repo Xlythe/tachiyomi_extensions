@@ -174,7 +174,7 @@ class Mangabat :
 
         adjacentPages
             ?.takeIf { adjacentIdentity != null }
-            ?.let { initialEdgeFingerprintPositions(it.size).forEach(::ensureAdjacentFingerprint) }
+            ?.let { mangabatFingerprintPositions(it.size).forEach(::ensureAdjacentFingerprint) }
 
         fun isDuplicate(
             index: Int,
@@ -187,10 +187,29 @@ class Mangabat :
                     ?: inspectEdgePage(page)?.also { inspectedPages[index] = it }
                     ?: return false
             currentFingerprints[position] = inspected.fingerprint
+            val normalizedFullPageDuplicate =
+                position >= 0 &&
+                    inspected.fullPageSignature?.let { candidate ->
+                    inspectedAdjacentPages
+                        .asSequence()
+                        .filter { (adjacentIndex) -> adjacentIndex < MANGABAT_EARLY_PAGE_WINDOW }
+                        .mapNotNull { (_, reference) -> reference.fullPageSignature }
+                        .any(candidate::isDuplicateOf)
+                } == true
             return inspected.forceExclude ||
-                referenceFingerprints.hasDuplicateFingerprintAtEdge(position, inspected.fingerprint)
+                referenceFingerprints.hasDuplicateFingerprintAtEdge(position, inspected.fingerprint) ||
+                position >= 0 && referenceFingerprints.hasShiftedMangabatOpeningDuplicate(inspected.fingerprint) ||
+                normalizedFullPageDuplicate
         }
 
+        // Scan a bounded opening window even after real pages appear. Scan groups often
+        // insert a repeated title card one or two pages into the chapter, so a sequential
+        // edge scan alone stops too early. Cross-position removal still requires an exact
+        // content hash, or the strict scaled-card matcher used for chapter-specific canvases.
+        val earlyScan =
+            scanMangabatEarlyDuplicates(pages) { index, page ->
+                isDuplicate(index, page, leadingPagePosition(index))
+            }
         val leadingScan =
             scanLeadingDuplicates(pages) { index, page ->
                 isDuplicate(index, page, leadingPagePosition(index))
@@ -210,9 +229,10 @@ class Mangabat :
             identity,
             currentFingerprints.map { (position, fingerprint) -> IndexedValue(position, fingerprint) },
         )
-        val inspectedIndices = leadingScan.inspectedIndices + trailingScan.inspectedIndices
+        val leadingInspectedIndices = earlyScan.inspectedIndices + leadingScan.inspectedIndices
+        val inspectedIndices = leadingInspectedIndices + trailingScan.inspectedIndices
         val duplicateIndices =
-            (leadingScan.duplicateIndices + trailingScan.duplicateIndices)
+            (earlyScan.duplicateIndices + leadingScan.duplicateIndices + trailingScan.duplicateIndices)
                 .takeUnless { it.size == pages.size }
                 .orEmpty()
         inspectedIndices
@@ -221,27 +241,35 @@ class Mangabat :
                 val page = pages[index]
                 val inspected = inspectedPages[index] ?: return@forEach
                 val oppositeEdgeReferences =
-                    if (index in leadingScan.inspectedIndices) {
+                    if (index in leadingInspectedIndices) {
                         trailingScan.inspectedIndices
                     } else {
-                        leadingScan.inspectedIndices
+                        leadingInspectedIndices
                     }.mapNotNull(inspectedPages::get)
                 val edgeReferences = inspectedAdjacentPages.values + oppositeEdgeReferences
                 val stripReferences = edgeReferences.mapNotNull(InspectedEdgePage::stripProfile)
-                val inspectLeading = index in leadingScan.inspectedIndices
+                val inspectLeading = index in leadingInspectedIndices
                 val inspectTrailing = index in trailingScan.inspectedIndices
+                val seamEdit =
+                    inspected.stripProfile?.generalizedSeamEdit(
+                        signatures = inspected.edgeRegionSignatures,
+                        references = edgeReferences.flatMap(InspectedEdgePage::edgeRegionSignatures),
+                        inspectLeading = inspectLeading,
+                        inspectTrailing = inspectTrailing,
+                    )
+                val stripEdit =
+                    inspected.stripProfile?.generalizedEdgeEdit(
+                        references = stripReferences,
+                        inspectLeading = inspectLeading,
+                        inspectTrailing = inspectTrailing,
+                    )
                 val edit =
                     inspected.knownEdit
-                        ?: inspected.stripProfile?.generalizedSeamEdit(
-                            signatures = inspected.edgeRegionSignatures,
-                            references = edgeReferences.flatMap(InspectedEdgePage::edgeRegionSignatures),
-                            inspectLeading = inspectLeading,
-                            inspectTrailing = inspectTrailing,
-                        )
-                        ?: inspected.stripProfile?.generalizedEdgeEdit(
-                            references = stripReferences,
-                            inspectLeading = inspectLeading,
-                            inspectTrailing = inspectTrailing,
+                        ?: agreeingMangabatEdgeEdit(
+                            seamEdit,
+                            stripEdit,
+                            inspected.fingerprint.width,
+                            inspected.fingerprint.height,
                         )
                 val originalUrl = page.imageUrl ?: return@forEach
                 val bounds = edit?.cropBounds(inspected.fingerprint.width, inspected.fingerprint.height)
@@ -278,6 +306,7 @@ class Mangabat :
                 InspectedEdgePage(
                     fingerprint = fingerprint,
                     originalImage = PrefetchedPageImage(bytes, body.contentType()?.toString()),
+                    fullPageSignature = createMangabatFullPageSignature(bytes),
                     stripProfile = stripProfile,
                     edgeRegionSignatures =
                     stripProfile?.let { createEdgeRegionSignatures(bytes, it) }.orEmpty(),
@@ -291,6 +320,16 @@ class Mangabat :
             null
         }
 
+    private fun createMangabatFullPageSignature(bytes: ByteArray): MangabatFullPageSignature? {
+        val source = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return null
+        return try {
+            source.blockAverageHash(0, source.height)?.let { hash ->
+                MangabatFullPageSignature(source.width, source.height, hash)
+            }
+        } finally {
+            source.recycle()
+        }
+    }
     private fun createEdgeStripProfile(
         bytes: ByteArray,
         width: Int,
@@ -407,6 +446,7 @@ internal data class MangabatChapter(
 private data class InspectedEdgePage(
     val fingerprint: PageFingerprint,
     val originalImage: PrefetchedPageImage,
+    val fullPageSignature: MangabatFullPageSignature?,
     val stripProfile: MangabatEdgeStripProfile?,
     val edgeRegionSignatures: List<MangabatEdgeRegionSignature>,
     val knownEdit: MangabatEdgePageEdit?,
@@ -432,6 +472,28 @@ internal data class MangabatEdgeStripProfile(
         get() = if (heightRows > 0) luma.size / heightRows else 0
 }
 
+internal data class MangabatFullPageSignature(
+    val width: Int,
+    val height: Int,
+    val hash: ByteArray,
+) {
+    fun isDuplicateOf(other: MangabatFullPageSignature): Boolean {
+        if (width <= 0 || width != other.width || height <= 0 || other.height <= 0 || hash.size != other.hash.size) {
+            return false
+        }
+        val heightRatio = maxOf(height, other.height).toDouble() / minOf(height, other.height)
+        if (heightRatio > MANGABAT_FULL_PAGE_MAXIMUM_HEIGHT_RATIO) {
+            return false
+        }
+        var distance = 0
+        for (index in hash.indices) {
+            if (hash[index] != other.hash[index] && ++distance > MANGABAT_FULL_PAGE_SIGNATURE_DISTANCE) {
+                return false
+            }
+        }
+        return true
+    }
+}
 internal data class MangabatEdgeRegionSignature(
     val edgeRows: Int,
     val fromTop: Boolean,
@@ -439,6 +501,7 @@ internal data class MangabatEdgeRegionSignature(
 ) {
     fun isDuplicateOf(other: MangabatEdgeRegionSignature): Boolean {
         if (
+            fromTop != other.fromTop ||
             kotlin.math.abs(edgeRows - other.edgeRows) > MAXIMUM_EDGE_SIGNATURE_ROW_DELTA ||
             hash.size != other.hash.size
         ) {
@@ -617,10 +680,9 @@ private fun MangabatEdgeStripProfile.repeatedEdgeRows(
                 if (reference.heightRows < rows) {
                     false
                 } else {
-                    (0..reference.heightRows - rows).any { referenceStart ->
-                        reference.hasVisualDetail(referenceStart, rows) &&
-                            regionsMatch(candidateStart, reference, referenceStart, rows, fromTop)
-                    }
+                    val referenceStart = if (fromTop) 0 else reference.heightRows - rows
+                    reference.hasVisualDetail(referenceStart, rows) &&
+                        regionsMatch(candidateStart, reference, referenceStart, rows, fromTop)
                 }
             }
         if (matched) {
@@ -727,6 +789,8 @@ private fun MangabatEdgeStripProfile.normalizedRowsToPixels(rows: Int): Int =
         (rows * originalWidth + profileWidth - 1) / profileWidth
     }
 
+private const val MANGABAT_FULL_PAGE_SIGNATURE_DISTANCE = 32
+private const val MANGABAT_FULL_PAGE_MAXIMUM_HEIGHT_RATIO = 1.2
 private const val EDGE_SIGNATURE_GRID_SIZE = 16
 private const val MAXIMUM_EDGE_SIGNATURE_DISTANCE = 72
 private const val MAXIMUM_EDGE_SIGNATURE_ROW_DELTA = 4
@@ -791,6 +855,49 @@ internal fun String.toMangabatEdgePageEdit(): MangabatEdgePageEdit? =
 
 private val KNOWN_MANGABAT_EDGE_PAGE_EDITS =
     mapOf(
+        // Global scan-group donation notice; unique among the surrounding 36 chapters.
+        "380976af8896613cf41c8baf933150f1566608bbce7d2512de1016e81c58a735" to
+            MangabatEdgePageEdit(remove = true),
+        // Global scan-group donation explainer; remove only this exact standalone page.
+        "3dad81b91bab96c116b000d1858584f1ff97f217c89ec4418f9c62e02f9cfbb4" to
+            MangabatEdgePageEdit(remove = true),
+        // Continuation pages from the same global donation solicitation.
+        "440aa8e557171633e95dfc62be2c599dc08523a5a60d35b0d45ee0362ce3f213" to
+            MangabatEdgePageEdit(remove = true),
+        "f5646528dd39539bf2eeff1012f5595cf6ab2fed9aa31575e0f3e9ef18f95889" to
+            MangabatEdgePageEdit(remove = true),
+        // Preserve the real panel above the standalone scan-group title card.
+        "ce3d5b01101395f9732572ddc166ea514c2ac30486766e1d5afe994e99f6de7d" to
+            MangabatEdgePageEdit(retainedHeight = 715),
+        // Preserve the real dialogue below the second half of the title card.
+        "485b505800f236d2021e0069b2906cc5c3cce0c3c94c8d4863aca09c8a05416b" to
+            MangabatEdgePageEdit(topOffset = 545),
+        // Standalone scan-group announcement; remove only this exact global content hash.
+        "96267e22823639ca84cf4b0a20f2a3836d122b56bfe76da93758dc84148c48ab" to
+            MangabatEdgePageEdit(remove = true),
+        // The same announcement is stitched above genuine comic content in another upload.
+        "350e5adee50348d8265f093b2b89e8a85c9ecd975929999dcfa496387f53b674" to
+            MangabatEdgePageEdit(topOffset = 470),
+        // Standalone promo and donation pages; exact global content hashes only.
+        "a4773fe64cd1ad1755c917dc9b25989b4d5d37f26535240818a39797db41c12b" to
+            MangabatEdgePageEdit(remove = true),
+        "f87af2f14ac21ebb326c0141ce113cd37f17f9a8875ec4832897efac09fb1f50" to
+            MangabatEdgePageEdit(remove = true),
+        // Preserve genuine panels around a promo spill and split scan-group title card.
+        "063047489f33ffb0cf11bd57edccc3cdca9c2dfd6df7c77457755f0c74c43663" to
+            MangabatEdgePageEdit(topOffset = 130),
+        "eff3515ade6737a44348a7c88027fda5b3fc2068c66d5e5e9393f2a14c523f93" to
+            MangabatEdgePageEdit(retainedHeight = 940),
+        "0a6f7ee3beca4d8c2de0cf196e1a9b694c19ce166dfbc836e2123d512f27f342" to
+            MangabatEdgePageEdit(topOffset = 640),
+        // Recruitment banners stitched above real comic content.
+        "a4ed10cb1dd8f175ffd6932d5e0d6a933b4efef2ced0f49b840c7133b131394e" to
+            MangabatEdgePageEdit(topOffset = 480),
+        "3d2c87c8cc0c28a5ba5ce25e627cb6adcd5d99935ca479b512dc29489cfbd080" to
+            MangabatEdgePageEdit(topOffset = 440),
+        // Long-form donation explainer from the same scan group.
+        "289b09d0300c8233b51b3f34960293cfe306b64aa15621e0485f52c31108e638" to
+            MangabatEdgePageEdit(remove = true),
         // Barbarian's Adventure in a Fantasy World, chapter 66: donation page.
         "613b33ef64a03537477d080305788367b14468d6bbbc2fb58e8740f4ce84d6ff" to
             MangabatEdgePageEdit(remove = true),
@@ -803,7 +910,60 @@ private val KNOWN_MANGABAT_EDGE_PAGE_EDITS =
         // Full-page scan-group promotion after the chapter has ended.
         "58593fee88b74a204572f1607791f92cc4cc7e64843c58c1fa7237ef7ad71b62" to
             MangabatEdgePageEdit(remove = true),
+        // Demonic Scans "read this chapter at" solicitation. The exact content hash
+        // keeps the removal global while avoiding visual guesses on legitimate endings.
+        "28bac9126d70960bdb5ba62e6408f8862df470424b2cd483abff2fd5c7d600e7" to
+            MangabatEdgePageEdit(remove = true),
     )
+
+internal fun agreeingMangabatEdgeEdit(
+    seamEdit: MangabatEdgePageEdit?,
+    stripEdit: MangabatEdgePageEdit?,
+    imageWidth: Int,
+    imageHeight: Int,
+): MangabatEdgePageEdit? {
+    val seamBounds = seamEdit?.cropBounds(imageWidth, imageHeight) ?: return null
+    val stripBounds = stripEdit?.cropBounds(imageWidth, imageHeight) ?: return null
+    return seamEdit.takeIf { seamBounds == stripBounds }
+}
+
+private const val MANGABAT_SHIFTED_CARD_HASH_THRESHOLD = 4
+private const val MANGABAT_SHIFTED_CARD_MAXIMUM_HEIGHT_RATIO = 1.2
+
+internal fun PageFingerprint.isShiftedMangabatOpeningDuplicateOf(other: PageFingerprint): Boolean {
+    val candidateHash = differenceHash ?: return false
+    val referenceHash = other.differenceHash ?: return false
+    if (width <= 0 || width != other.width || height <= 0 || other.height <= 0) {
+        return false
+    }
+    val heightRatio = maxOf(height, other.height).toDouble() / minOf(height, other.height)
+    return heightRatio <= MANGABAT_SHIFTED_CARD_MAXIMUM_HEIGHT_RATIO &&
+        java.lang.Long.bitCount(candidateHash xor referenceHash) <= MANGABAT_SHIFTED_CARD_HASH_THRESHOLD
+}
+
+internal fun Map<Int, List<PageFingerprint>>.hasShiftedMangabatOpeningDuplicate(candidate: PageFingerprint): Boolean =
+    entries
+        .asSequence()
+        .filter { (position) -> position >= 0 }
+        .flatMap { (_, fingerprints) -> fingerprints.asSequence() }
+        .any(candidate::isShiftedMangabatOpeningDuplicateOf)
+
+internal const val MANGABAT_EARLY_PAGE_WINDOW = 12
+
+internal fun mangabatFingerprintPositions(pageCount: Int): List<Int> {
+    val early = (0 until minOf(pageCount, MANGABAT_EARLY_PAGE_WINDOW)).map(::leadingPagePosition)
+    val trailing = initialEdgeFingerprintPositions(pageCount).filter { it < 0 }
+    return early + trailing
+}
+
+internal fun <T> scanMangabatEarlyDuplicates(
+    items: List<T>,
+    isDuplicate: (index: Int, item: T) -> Boolean,
+): keiyoushi.utils.LeadingDuplicateScanResult {
+    val inspected = (0 until minOf(items.size, MANGABAT_EARLY_PAGE_WINDOW)).toSet()
+    val duplicates = inspected.filterTo(linkedSetOf()) { index -> isDuplicate(index, items[index]) }
+    return keiyoushi.utils.LeadingDuplicateScanResult(inspected, duplicates)
+}
 
 internal data class MangabatChapterLocation(
     val seriesSlug: String,

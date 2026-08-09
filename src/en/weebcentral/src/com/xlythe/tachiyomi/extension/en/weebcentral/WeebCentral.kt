@@ -50,7 +50,7 @@ class WeebCentral : ParsedHttpSource() {
 
     override val supportsLatest = true
 
-    private val prefetchedPageImages = PrefetchedPageImageStore()
+    private val prefetchedPageImages = PrefetchedPageImageStore(maxBytes = 64 * 1024 * 1024)
 
     override val client =
         network.cloudflareClient
@@ -392,6 +392,14 @@ class WeebCentral : ParsedHttpSource() {
                     ?: return false
             currentFingerprints[position] = inspected.fingerprint
             return inspected.forceExclude ||
+                (
+                    position >= 0 &&
+                        inspected.templateSignature?.let { candidate ->
+                        inspectedAdjacentPages.values.any { reference ->
+                            reference.templateSignature?.let(candidate::isDuplicateOf) == true
+                        }
+                    } == true
+                    ) ||
                 referenceFingerprints.hasDuplicateFingerprintAtEdge(position, inspected.fingerprint)
         }
 
@@ -447,7 +455,7 @@ class WeebCentral : ParsedHttpSource() {
                     croppedImage?.let { originalUrl.withWeebCentralEdgeCropCacheKey(requireNotNull(bounds)) }
                         ?: originalUrl
                 page.imageUrl = servedUrl
-                prefetchedPageImages.put(servedUrl, croppedImage ?: inspected.originalImage)
+                croppedImage?.let { prefetchedPageImages.put(servedUrl, it) }
             }
 
         return reindexPages(pages, duplicateIndices)
@@ -474,6 +482,7 @@ class WeebCentral : ParsedHttpSource() {
                     stripProfile = stripProfile,
                     edgeRegionSignatures =
                     stripProfile?.let { createEdgeRegionSignatures(bytes, it) }.orEmpty(),
+                    templateSignature = createWeebCentralTemplateSignature(bytes),
                     forceExclude =
                     isStructurallyInvalidWeebCentralEdgeImage(fingerprint.width, fingerprint.height),
                 )
@@ -481,6 +490,25 @@ class WeebCentral : ParsedHttpSource() {
         } catch (_: Exception) {
             null
         }
+
+    private fun createWeebCentralTemplateSignature(bytes: ByteArray): WeebCentralTemplateSignature? {
+        val source = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return null
+        var scaled: Bitmap? = null
+        return try {
+            if (source.width < source.height || source.width <= 0 || source.height <= 0) return null
+            scaled = Bitmap.createScaledBitmap(source, TEMPLATE_SIGNATURE_GRID_SIZE, TEMPLATE_SIGNATURE_GRID_SIZE, true)
+            val pixels = IntArray(TEMPLATE_SIGNATURE_GRID_SIZE * TEMPLATE_SIGNATURE_GRID_SIZE)
+            scaled.getPixels(pixels, 0, TEMPLATE_SIGNATURE_GRID_SIZE, 0, 0, TEMPLATE_SIGNATURE_GRID_SIZE, TEMPLATE_SIGNATURE_GRID_SIZE)
+            WeebCentralTemplateSignature(
+                width = source.width,
+                height = source.height,
+                luma = ByteArray(pixels.size) { index -> (pixels[index].weebCentralLuminance() / 16).toByte() },
+            )
+        } finally {
+            if (scaled !== source) scaled?.recycle()
+            source.recycle()
+        }
+    }
 
     private fun createEdgeStripProfile(
         bytes: ByteArray,
@@ -595,8 +623,44 @@ private data class InspectedEdgePage(
     val originalImage: PrefetchedPageImage,
     val stripProfile: WeebCentralEdgeStripProfile?,
     val edgeRegionSignatures: List<WeebCentralEdgeRegionSignature>,
+    val templateSignature: WeebCentralTemplateSignature?,
     val forceExclude: Boolean,
 )
+
+internal data class WeebCentralTemplateSignature(
+    val width: Int,
+    val height: Int,
+    val luma: ByteArray,
+) {
+    fun isDuplicateOf(other: WeebCentralTemplateSignature): Boolean {
+        if (
+            width < height || other.width < other.height ||
+            width != other.width || height != other.height ||
+            luma.size != TEMPLATE_SIGNATURE_GRID_SIZE * TEMPLATE_SIGNATURE_GRID_SIZE ||
+            other.luma.size != luma.size
+        ) {
+            return false
+        }
+
+        var difference = 0
+        var samples = 0
+        for (index in luma.indices) {
+            val row = index / TEMPLATE_SIGNATURE_GRID_SIZE
+            val column = index % TEMPLATE_SIGNATURE_GRID_SIZE
+            if (
+                row >= TEMPLATE_SIGNATURE_PERIMETER &&
+                row < TEMPLATE_SIGNATURE_GRID_SIZE - TEMPLATE_SIGNATURE_PERIMETER &&
+                column >= TEMPLATE_SIGNATURE_PERIMETER &&
+                column < TEMPLATE_SIGNATURE_GRID_SIZE - TEMPLATE_SIGNATURE_PERIMETER
+            ) {
+                continue
+            }
+            difference += kotlin.math.abs((luma[index].toInt() and 0xFF) - (other.luma[index].toInt() and 0xFF))
+            samples++
+        }
+        return difference <= samples * MAXIMUM_TEMPLATE_MEAN_LUMA_DIFFERENCE
+    }
+}
 
 internal fun Request.withFreshWeebCentralImageInspection(): Request =
     newBuilder()
@@ -638,13 +702,16 @@ internal data class WeebCentralEdgeRegionSignature(
             } else {
                 MAXIMUM_WEAK_EDGE_SIGNATURE_DISTANCE
             }
-        var distance = 0
+        var directDistance = 0
+        var invertedDistance = 0
         for (index in hash.indices) {
-            if (hash[index] != other.hash[index] && ++distance > maximumDistance) {
+            if (hash[index] != other.hash[index]) directDistance++
+            if (hash[index] == other.hash[index]) invertedDistance++
+            if (directDistance > maximumDistance && invertedDistance > maximumDistance) {
                 return false
             }
         }
-        return true
+        return minOf(directDistance, invertedDistance) <= maximumDistance
     }
 }
 
@@ -849,13 +916,16 @@ internal fun String.withWeebCentralEdgeCropCacheKey(bounds: WeebCentralCropBound
         ?.newBuilder()
         ?.setQueryParameter(
             WEEBCENTRAL_EDGE_CROP_QUERY_PARAMETER,
-            "v1-${bounds.x}-${bounds.y}-${bounds.width}-${bounds.height}",
+            "v4-${bounds.x}-${bounds.y}-${bounds.width}-${bounds.height}",
         )
         ?.build()
         ?.toString()
         ?: this
 
 private const val EDGE_SIGNATURE_GRID_SIZE = 16
+private const val TEMPLATE_SIGNATURE_GRID_SIZE = 32
+private const val TEMPLATE_SIGNATURE_PERIMETER = 8
+private const val MAXIMUM_TEMPLATE_MEAN_LUMA_DIFFERENCE = 2
 private const val MAXIMUM_EDGE_SIGNATURE_DISTANCE = 72
 private const val MAXIMUM_WEAK_EDGE_SIGNATURE_DISTANCE = 24
 private const val MAXIMUM_EDGE_SIGNATURE_ROW_DELTA = 4
