@@ -51,7 +51,11 @@ android {
 
     buildTypes {
         release {
-            signingConfig signingConfigs.release
+            // CI writes signingkey.jks only when the SIGNING_KEY secret exists;
+            // without it (forks, local builds) release APKs are left unsigned.
+            if (rootProject.file("signingkey.jks").exists()) {
+                signingConfig signingConfigs.release
+            }
             minifyEnabled false
         }
     }
