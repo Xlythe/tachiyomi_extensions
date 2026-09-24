@@ -17,7 +17,7 @@ env:
 
 jobs:
   build_individual:
-    name: Build individual modules
+    name: Build individual modules and publish repo
     runs-on: ubuntu-latest
     steps:
       - name: Checkout main branch
@@ -42,42 +42,44 @@ jobs:
         with:
           arguments: assembleRelease
 
-      - name: Upload APKs
-        uses: actions/upload-artifact@v4
+      # Publishing used to run in a separate job that received the APKs via
+      # actions/upload-artifact + download-artifact. It now runs in this job so
+      # no Actions artifact storage is used: the APKs are staged into the same
+      # ~/apk-artifacts directory the old download step produced, which
+      # .github/scripts/move-apks.sh reads.
+      - name: Stage APKs for publishing
         if: "github.repository == 'tachiyomiorg/extensions'"
-        with:
-          name: "individual-apks"
-          path: "**/*.apk"
-          retention-days: 1
+        run: |
+          shopt -s globstar nullglob
+          DEST=~/apk-artifacts/individual-apks
+          rm -rf ~/apk-artifacts && mkdir -p "$DEST"
+          APKS=( **/*.apk )
+          if [ "${#APKS[@]}" -eq 0 ]; then
+            echo "::error::No APKs were built"
+            exit 1
+          fi
+          cp --parents "${APKS[@]}" "$DEST"
+          echo "Staged ${#APKS[@]} APKs"
 
       - name: Clean up CI files
         run: rm signingkey.jks
 
-  publish_repo:
-    name: Publish repo
-    needs:
-      - build_individual
-    if: "github.repository == 'tachiyomiorg/extensions'"
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download APK artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: ~/apk-artifacts
-
-      - name: Set up JDK
+      - name: Set up JDK 17 for publishing
+        if: "github.repository == 'tachiyomiorg/extensions'"
         uses: actions/setup-java@v4
         with:
           java-version: 17
           distribution: adopt
 
-      - name: Checkout main branch
+      - name: Checkout main branch for publishing
+        if: "github.repository == 'tachiyomiorg/extensions'"
         uses: actions/checkout@v4
         with:
           ref: main
           path: main
 
       - name: Create repo artifacts
+        if: "github.repository == 'tachiyomiorg/extensions'"
         run: |
           cd main
           ./.github/scripts/move-apks.sh
@@ -87,12 +89,14 @@ jobs:
           ./.github/scripts/create-repo.sh
 
       - name: Checkout repo branch
+        if: "github.repository == 'tachiyomiorg/extensions'"
         uses: actions/checkout@v4
         with:
           ref: repo
           path: repo
 
       - name: Deploy repo
+        if: "github.repository == 'tachiyomiorg/extensions'"
         run: |
           cd repo
           ../main/.github/scripts/commit-repo.sh
